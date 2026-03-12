@@ -1,0 +1,27 @@
+{
+  "claude_desktop_example": {
+    "mcpServers": {
+      "goofish": {
+        "command": "node",
+        "args": [
+          "/absolute/path/to/goofish-mcp-server/index.js"
+        ],
+        "env": {
+          "GOOFISH_PROFILE_DIR": "/absolute/path/to/goofish-mcp-server/.profiles/goofish",
+          "GOOFISH_HEADLESS": "0"
+        }
+      }
+    }
+  },
+  "generic_stdio_example": {
+    "note": "Use the same stdio command in any MCP client that supports external stdio servers.",
+    "command": "node",
+    "args": [
+      "/absolute/path/to/goofish-mcp-server/index.js"
+    ],
+    "env": {
+      "GOOFISH_PROFILE_DIR": "/absolute/path/to/goofish-mcp-server/.profiles/goofish",
+      "GOOFISH_HEADLESS": "0"
+    }
+  }
+}

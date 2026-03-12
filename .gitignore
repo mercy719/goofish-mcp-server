@@ -1,0 +1,5 @@
+node_modules/
+.profiles/
+.DS_Store
+.env
+.env.*
