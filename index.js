@@ -4,6 +4,9 @@ const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontext
 const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const http = require('http');
+const https = require('https');
 const { z } = require('zod');
 
 const PROFILE_DIR = process.env.GOOFISH_PROFILE_DIR || path.join(process.cwd(), '.profiles', 'goofish');
@@ -186,69 +189,164 @@ class GoofishRuntime {
     }
   }
 
-  async publishItem({ title, desc, price_yuan, category_id, images }) {
-    const page = await this.newPage('https://www.goofish.com/');
+  async publishItem({ title, desc, price_yuan, category_id, images = [] }) {
+    const page = await this.newPage('https://www.goofish.com/publish');
+    const tmpFiles = [];
     try {
-      await this.ensureGoofishReady(page);
-      const soldPrice = Math.round(Number(price_yuan) * 100);
-      if (!Number.isFinite(soldPrice)) {
+      const numericPrice = Number(price_yuan);
+      if (!Number.isFinite(numericPrice)) {
         throw new Error('Invalid price_yuan, expected a number');
       }
 
-      const data = {
-        itemDO: {
-          title,
-          desc,
-          soldPrice: String(soldPrice),
-          ...(category_id ? { categoryId: category_id } : {}),
-          ...(Array.isArray(images) && images.length > 0 ? { images } : {}),
-        },
-        device: {},
-        feature: {},
+      const downloadImageToTemp = async (url, redirectCount = 0) => {
+        if (redirectCount > 5) throw new Error(`Too many redirects: ${url}`);
+        const client = url.startsWith('https://') ? https : http;
+        const ext = path.extname(new URL(url).pathname) || '.jpg';
+        const tmpPath = path.join(os.tmpdir(), `goofish_img_${Date.now()}_${Math.random().toString(16).slice(2)}${ext}`);
+
+        await new Promise((resolve, reject) => {
+          const req = client.get(url, (res) => {
+            if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+              res.resume();
+              const redirectedUrl = new URL(res.headers.location, url).toString();
+              downloadImageToTemp(redirectedUrl, redirectCount + 1).then(resolve).catch(reject);
+              return;
+            }
+            if (res.statusCode !== 200) {
+              reject(new Error(`Failed to download image (${res.statusCode}): ${url}`));
+              return;
+            }
+            const writer = fs.createWriteStream(tmpPath);
+            res.pipe(writer);
+            writer.on('finish', () => {
+              writer.close(() => resolve(tmpPath));
+            });
+            writer.on('error', reject);
+          });
+          req.on('error', reject);
+        });
+
+        return tmpPath;
       };
 
-      const resp = await page.evaluate(async (payload) => {
-        return await window.lib.mtop.request({
-          api: 'mtop.idle.item.publish',
-          v: '2.0',
-          type: 'POST',
-          method: 'POST',
-          appKey: '34839810',
-          accountSite: 'xianyu',
-          dataType: 'json',
-          timeout: 20000,
-          needLoginPC: false,
-          showErrorToast: false,
-          needLogin: false,
-          sessionOption: 'AutoLoginOnly',
-          ecode: 0,
-          data: JSON.stringify(payload),
-        });
-      }, data);
+      const fillFirst = async (selectors, value) => {
+        for (const selector of selectors) {
+          const locator = page.locator(selector).first();
+          if ((await locator.count()) > 0) {
+            await locator.click({ timeout: 5000 });
+            await locator.fill(String(value));
+            return true;
+          }
+        }
+        return false;
+      };
 
-      const ret = Array.isArray(resp?.ret) ? resp.ret : [];
-      const success = ret.some(v => String(v).includes('SUCCESS'));
-      if (!success) {
-        return {
-          ok: false,
-          error: 'publish failed',
-          ret,
-          raw: resp,
-        };
+      try {
+        await page.waitForSelector('input, textarea, [contenteditable="true"]', { timeout: 30000 });
+      } catch (error) {
+        return { ok: false, error: 'Form did not load - login may have expired' };
       }
+
+      if (Array.isArray(images) && images.length > 0) {
+        const uploadPaths = [];
+        for (const src of images) {
+          if (!src) continue;
+          if (/^https?:\/\//i.test(src)) {
+            const tmpPath = await downloadImageToTemp(src);
+            tmpFiles.push(tmpPath);
+            uploadPaths.push(tmpPath);
+          } else {
+            const resolved = path.resolve(src);
+            if (!fs.existsSync(resolved)) {
+              return { ok: false, error: `Image file not found: ${resolved}` };
+            }
+            uploadPaths.push(resolved);
+          }
+        }
+
+        if (uploadPaths.length > 0) {
+          let fileInput = page.locator('input[type="file"]').first();
+          if ((await fileInput.count()) === 0) {
+            await page.click('text=上传', { timeout: 5000 }).catch(() => {});
+            await page.waitForSelector('input[type="file"]', { timeout: 10000 });
+            fileInput = page.locator('input[type="file"]').first();
+          }
+          if ((await fileInput.count()) === 0) {
+            return { ok: false, error: 'Failed to find image upload input' };
+          }
+          await fileInput.setInputFiles(uploadPaths);
+          await page.waitForTimeout(1000);
+        }
+      }
+
+      const titleFilled = await fillFirst([
+        'input[placeholder*="标题"]',
+        'input[placeholder*="宝贝"]',
+        'input[placeholder*="商品"]',
+        'input[type="text"]',
+      ], title);
+      if (!titleFilled) {
+        return { ok: false, error: 'Failed to find title input' };
+      }
+
+      const descFilled = await fillFirst([
+        'textarea[placeholder*="描述"]',
+        'textarea',
+        '[contenteditable="true"]',
+      ], desc);
+      if (!descFilled) {
+        return { ok: false, error: 'Failed to find description input' };
+      }
+
+      const priceFilled = await fillFirst([
+        'input[placeholder*="价格"]',
+        'input[placeholder*="售价"]',
+        'input[type="number"]',
+      ], String(numericPrice));
+      if (!priceFilled) {
+        return { ok: false, error: 'Failed to find price input' };
+      }
+
+      const submitBtn = page.locator('button:has-text("发布"), button:has-text("确认发布"), [role="button"]:has-text("发布")').first();
+      if ((await submitBtn.count()) === 0) {
+        return { ok: false, error: 'Failed to find publish button' };
+      }
+      await submitBtn.click({ timeout: 10000 });
+
+      let success = false;
+      const successTextWait = Promise.race([
+        page.waitForSelector('text=发布成功', { timeout: 15000 }),
+        page.waitForSelector('text=已发布', { timeout: 15000 }),
+        page.waitForSelector('text=宝贝发布成功', { timeout: 15000 }),
+        page.waitForSelector('text=审核中', { timeout: 15000 }),
+      ]);
+      await Promise.race([
+        page.waitForURL(/item\?id=|\/item\//, { timeout: 15000 }).then(() => { success = true; }),
+        successTextWait.then(() => { success = true; }),
+      ]).catch(() => {});
+
+      if (!success) {
+        return { ok: false, error: 'Failed to submit form' };
+      }
+
+      const currentUrl = page.url();
+      const parsed = /[?&]id=(\d+)|\/item\/(\d+)/.exec(currentUrl);
+      const itemId = parsed ? (parsed[1] || parsed[2]) : null;
 
       return {
         ok: true,
-        item_id: resp?.data?.itemId ? String(resp.data.itemId) : null,
-        ret,
-        raw: resp,
+        item_id: itemId ? String(itemId) : null,
       };
     } catch (error) {
       return {
         ok: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: 'Failed to submit form',
+        details: error instanceof Error ? error.message : String(error),
       };
     } finally {
+      for (const p of tmpFiles) {
+        try { fs.unlinkSync(p); } catch {}
+      }
       await page.close();
     }
   }
@@ -311,7 +409,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           desc: { type: 'string', description: '商品描述' },
           price_yuan: { type: 'number', description: '售价（元），如 99.5' },
           category_id: { type: 'string', description: '分类ID（可选）' },
-          images: { type: 'array', items: { type: 'string' }, description: '图片URL列表（可选）' },
+          images: { type: 'array', items: { type: 'string' }, description: '图片本地路径列表（如 /tmp/img.jpg），可选' },
         },
         required: ['title', 'desc', 'price_yuan'],
       },
