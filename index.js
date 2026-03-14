@@ -186,6 +186,73 @@ class GoofishRuntime {
     }
   }
 
+  async publishItem({ title, desc, price_yuan, category_id, images }) {
+    const page = await this.newPage('https://www.goofish.com/');
+    try {
+      await this.ensureGoofishReady(page);
+      const soldPrice = Math.round(Number(price_yuan) * 100);
+      if (!Number.isFinite(soldPrice)) {
+        throw new Error('Invalid price_yuan, expected a number');
+      }
+
+      const data = {
+        itemDO: {
+          title,
+          desc,
+          soldPrice: String(soldPrice),
+          ...(category_id ? { categoryId: category_id } : {}),
+          ...(Array.isArray(images) && images.length > 0 ? { images } : {}),
+        },
+        device: {},
+        feature: {},
+      };
+
+      const resp = await page.evaluate(async (payload) => {
+        return await window.lib.mtop.request({
+          api: 'mtop.idle.item.publish',
+          v: '2.0',
+          type: 'POST',
+          method: 'POST',
+          appKey: '34839810',
+          accountSite: 'xianyu',
+          dataType: 'json',
+          timeout: 20000,
+          needLoginPC: false,
+          showErrorToast: false,
+          needLogin: false,
+          sessionOption: 'AutoLoginOnly',
+          ecode: 0,
+          data: JSON.stringify(payload),
+        });
+      }, data);
+
+      const ret = Array.isArray(resp?.ret) ? resp.ret : [];
+      const success = ret.some(v => String(v).includes('SUCCESS'));
+      if (!success) {
+        return {
+          ok: false,
+          error: 'publish failed',
+          ret,
+          raw: resp,
+        };
+      }
+
+      return {
+        ok: true,
+        item_id: resp?.data?.itemId ? String(resp.data.itemId) : null,
+        ret,
+        raw: resp,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      await page.close();
+    }
+  }
+
   async monitorKeyword(keyword, maxItems = 20, dedupeKey = 'item_id') {
     const result = await this.searchItems(keyword, maxItems);
     return { ...makeMonitorSnapshot(keyword, result.items, dedupeKey), source: result.source, source_url: result.source_url };
@@ -234,6 +301,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['keyword'],
       },
     },
+    {
+      name: 'publish_item',
+      description: 'Publish a new Goofish/Xianyu second-hand item listing.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: '商品标题' },
+          desc: { type: 'string', description: '商品描述' },
+          price_yuan: { type: 'number', description: '售价（元），如 99.5' },
+          category_id: { type: 'string', description: '分类ID（可选）' },
+          images: { type: 'array', items: { type: 'string' }, description: '图片URL列表（可选）' },
+        },
+        required: ['title', 'desc', 'price_yuan'],
+      },
+    },
   ],
 }));
 
@@ -255,6 +337,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === 'monitor_keyword') {
     const parsed = z.object({ keyword: z.string(), max_items: z.number().int().min(1).max(100).default(20), dedupe_key: z.string().default('item_id') }).parse(args);
     const result = await runtime.monitorKeyword(parsed.keyword, parsed.max_items, parsed.dedupe_key);
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  }
+
+  if (name === 'publish_item') {
+    const parsed = z.object({
+      title: z.string(),
+      desc: z.string(),
+      price_yuan: z.number(),
+      category_id: z.string().optional(),
+      images: z.array(z.string()).optional(),
+    }).parse(args);
+    const result = await runtime.publishItem(parsed);
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   }
 
